@@ -1,0 +1,1892 @@
+#include "mainWindow.hpp"
+
+#include <imgui.h>
+#include <string>
+
+#include <cmath>
+#include "log.hpp"
+#include <duaLib.h>
+#include "scePadHandle.hpp"
+#include "utils.hpp"
+#include <nfd.h>
+#include <platform_folders.h>
+#include <filesystem>
+#include <fstream>
+#include "controllerHotkey.hpp"
+#include <process.hpp>
+#include "applicationVersion.hpp"
+#include "dsyFileRegistry.hpp"
+
+#define cstr(string) m_Strings.GetString(string).c_str()
+#define strr(string) m_Strings.GetString(string)
+
+bool MainWindow::About(bool *open)
+{
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.1f, 0.1f, 0.1f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.1f, 0.1f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+
+	if (!ImGui::Begin("About DualSenseY", open, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking))
+	{
+		ImGui::PopStyleColor(2);
+		ImGui::End();
+		return false;
+	}
+
+	ImGui::Text("Version %d", g_LocalAppVersion);
+	ImGui::Text("Made by Wujek_Foliarz");
+	ImGui::Text("DualSenseY is licensed under the MIT License,");
+	ImGui::Text("see LICENSE for more information.");
+
+	// ImGui::NewLine();
+	// ImGui::Text("ążźćłó こにちは 안녕하세요 Привет สวัสดี äöüßéèáç");
+
+	ImGui::End();
+	ImGui::PopStyleColor(3);
+	return true;
+}
+
+static bool showLoadFailedError = false;
+static bool showSetDefaultConfigSuccess = false;
+static bool showControllerNotConnectedError = false;
+bool MainWindow::MenuBar(int &currentController, s_scePadSettings &scePadSettings)
+{
+	static bool openAbout = false;
+
+	if (ImGui::BeginMainMenuBar())
+	{
+		if (ImGui::BeginMenu(cstr("File")))
+		{
+
+			if (ImGui::MenuItem(cstr("Save")))
+			{
+				nfdchar_t *outPath = NULL;
+				nfdresult_t result = NFD_SaveDialog("dsy", NULL, &outPath);
+
+				if (result == NFD_OKAY)
+				{
+					std::string outPathString(outPath);
+					if (outPathString.find(".dsy") == std::string::npos)
+					{
+						outPathString += ".dsy";
+					}
+					SaveSettingsToFile(scePadSettings, outPathString);
+					free(outPath);
+				}
+				else
+				{
+					LOGE("Failed to open save dialog: %d", result);
+				}
+			}
+
+			if (ImGui::MenuItem(cstr("Load")))
+			{
+
+				nfdchar_t *outPath = NULL;
+				nfdresult_t result = NFD_OpenDialog("dsy", NULL, &outPath);
+
+				if (result == NFD_OKAY)
+				{
+					if (!LoadSettingsFromFile(&scePadSettings, outPath))
+						showLoadFailedError = true;
+					else
+						scePadSettings.WasHidHideRanAfterLoad = false;
+
+					free(outPath);
+				}
+			}
+
+			if (ImGui::MenuItem(cstr("SetDefaultConfig")))
+			{
+				std::filesystem::path pathToDSYSaves = std::filesystem::u8path(sago::getDocumentsFolder() + "/DSY/DefaultConfigs/");
+				if (!std::filesystem::is_directory(pathToDSYSaves))
+					std::filesystem::create_directories(pathToDSYSaves);
+
+				nfdchar_t *outPath = NULL;
+				nfdresult_t result = NFD_OpenDialog("dsy", NULL, &outPath);
+				s_scePadSettings tempSettings = {};
+
+				if (result == NFD_OKAY)
+				{
+					if (!LoadSettingsFromFile(&tempSettings, outPath))
+						showLoadFailedError = true;
+
+					std::string macAddress = scePadGetMacAddress(g_ScePad[currentController]);
+
+					if (macAddress == "")
+						showControllerNotConnectedError = true;
+
+					if (!showLoadFailedError && !showControllerNotConnectedError)
+					{
+						std::string cleanMac = macAddress;
+						cleanMac.erase(std::remove(cleanMac.begin(), cleanMac.end(), ':'), cleanMac.end());
+						std::filesystem::path filePath = pathToDSYSaves / cleanMac;
+						std::ofstream file(filePath);
+						file << outPath;
+						file.close();
+					}
+
+					free(outPath);
+				}
+			}
+
+			if (ImGui::MenuItem(cstr("RemoveDefaultConfig")))
+			{
+				std::string macAddress = scePadGetMacAddress(g_ScePad[currentController]);
+
+				if (macAddress != "")
+				{
+					RemoveDefaultConfigByMac(macAddress);
+				}
+			}
+
+#ifdef WINDOWS
+			if (ImGui::MenuItem(cstr("AssociateDSYFile")))
+			{
+				RegisterFileAssociation();
+			}
+#endif
+
+			ImGui::EndMenu();
+		}
+
+		if (ImGui::BeginMenu(cstr("Settings")))
+		{
+
+			ImGui::SetNextItemWidth(300);
+			if (ImGui::BeginCombo(cstr("Language"), g_LanguageName[m_AppSettings.SelectedLanguage].c_str()))
+			{
+				int currentItem = 0;
+				int index = 0;
+
+				ImGuiIO &io = ImGui::GetIO();
+				bool isSelected = (currentItem == index);
+				for (auto &[code, name] : g_LanguageName)
+				{
+
+					int fontIndex = g_FontIndex[code];
+					if (fontIndex != 0)
+						ImGui::PushFont(io.Fonts->Fonts[fontIndex]);
+
+					if (ImGui::Selectable(name.c_str(), isSelected))
+					{
+						currentItem = index;
+						m_AppSettings.SelectedLanguage = code;
+						SaveAppSettings(&m_AppSettings);
+						io.FontDefault = io.Fonts->Fonts[fontIndex];
+						m_Strings.ReadStringsFromJson(CountryCodeToFile(code));
+					}
+
+					if (fontIndex != 0)
+						ImGui::PopFont();
+
+					index++;
+				}
+
+				ImGui::EndCombo();
+			}
+
+			if (ImGui::MenuItem(cstr("HideToTrayOnMinimize"), NULL, &m_AppSettings.HideToTrayOnMinimize))
+				SaveAppSettings(&m_AppSettings);
+			if (ImGui::MenuItem(cstr("HideToTrayOnStart"), NULL, &m_AppSettings.HideToTrayOnStart))
+				SaveAppSettings(&m_AppSettings);
+			if (ImGui::MenuItem(cstr("DisconnectAllBTDevicesOnExit"), NULL, &m_AppSettings.DisableAllBluetoothControllersOnExit))
+				SaveAppSettings(&m_AppSettings);
+			if (ImGui::MenuItem(cstr("DontConnectToServerOnStart"), NULL, &m_AppSettings.DontConnectToServerOnStart))
+				SaveAppSettings(&m_AppSettings);
+
+			int udpTimeout = (int)m_AppSettings.UdpTimeoutSeconds;
+			ImGui::SetNextItemWidth(150);
+			if (ImGui::InputInt(cstr("UdpTimeoutSeconds"), &udpTimeout)) {
+				m_AppSettings.UdpTimeoutSeconds = udpTimeout < 0 ? 0u : (uint32_t)udpTimeout;
+				m_Udp.SetTimeoutSeconds(m_AppSettings.UdpTimeoutSeconds);
+				SaveAppSettings(&m_AppSettings);
+			}
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("%s", cstr("UdpTimeoutSecondsTooltip"));
+			ImGui::EndMenu();
+		}
+
+		if (ImGui::BeginMenu(cstr("Help")))
+		{
+			ImGui::TextLinkOpenURL("Discord", "https://discord.gg/AFYvxf282U");
+			ImGui::TextLinkOpenURL("GitHub", "https://github.com/WujekFoliarz/DualSenseY-v2/issues");
+			ImGui::MenuItem(cstr("About"), "", &openAbout);
+
+			ImGui::EndMenu();
+		}
+
+		float textWidth = ImGui::CalcTextSize(std::string(strr("UDPStatus") + ":" + strr("Inactive")).c_str()).x + 10;
+		ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - textWidth);
+		ImGui::Text(std::string(strr("UDPStatus") + ":").c_str());
+		if (m_Udp.IsActive())
+			ImGui::TextColored(ImVec4(0, 1, 0, 1), cstr("Active"));
+		else
+			ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("Inactive"));
+
+		ImGui::EndMainMenuBar();
+	}
+
+	if (openAbout)
+		About(&openAbout);
+
+	return true;
+}
+
+bool MainWindow::Controllers(int &currentController, s_scePadSettings &scePadSettings, float scale)
+{
+	ImGui::SeparatorText(cstr("Controller"));
+
+	bool noneConnected = true;
+	for (uint32_t i = 0; i < 4; i++)
+	{
+		s_ScePadData data = {};
+		int result = scePadReadState(g_ScePad[i], &data);
+		if (result == SCE_OK)
+		{
+			noneConnected = false;
+			ImGui::RadioButton(std::to_string(i + 1).c_str(), &currentController, i);
+			ImGui::SameLine();
+		}
+	}
+
+	if (noneConnected)
+	{
+		ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("NoControllersConnected"));
+		return false;
+	}
+
+	ImGui::NewLine();
+	return true;
+}
+
+bool MainWindow::Led(s_scePadSettings &scePadSettings, float scale)
+{
+	if (m_Udp.IsActive())
+		return false;
+
+	ImGui::SeparatorText(cstr("LedSection"));
+
+	ImGui::Checkbox(cstr("DisablePlayerLED"), &scePadSettings.disablePlayerLed);
+	ImGui::Checkbox(cstr("AudioToLED"), &scePadSettings.audioToLed);
+	ImGui::Checkbox(cstr("DiscoMode"), &scePadSettings.discoMode);
+	if (scePadSettings.discoMode)
+	{
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(300);
+		ImGui::SliderFloat(cstr("Speed"), &scePadSettings.discoModeSpeed, 0.020, 2.0);
+	}
+
+	ImGui::Text(cstr("PlayerLedBrightness"));
+	ImGui::SameLine();
+	ImGui::RadioButton(cstr("High"), &scePadSettings.brightness, 0);
+	ImGui::SameLine();
+	ImGui::RadioButton(cstr("Medium"), &scePadSettings.brightness, 1);
+	ImGui::SameLine();
+	ImGui::RadioButton(cstr("Low"), &scePadSettings.brightness, 2);
+
+	if (ImGui::TreeNode(cstr("ColorPicker")))
+	{
+		ImGui::SetNextItemWidth(scale);
+		ImGui::ColorPicker3(cstr("LightbarColor"), scePadSettings.led.data(), ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview);
+		ImGui::TreePop();
+	}
+
+	return true;
+}
+
+bool MainWindow::Audio(int currentController, s_scePadSettings &scePadSettings)
+{
+	static bool failedToStart = false;
+	int busType = 0;
+
+	ImGui::SeparatorText(cstr("Audio"));
+
+	static bool wasChecked = false;
+	ImGui::Checkbox(cstr("Audio passthrough"), &scePadSettings.audioPassthrough);
+
+#ifdef LINUX
+	std::vector<std::string> captureDeviceList = m_Audio.GetCaptureDeviceList();
+	static int selectedDevice = 0;
+	ImGui::SetNextItemWidth(400);
+	if (selectedDevice < 0 || selectedDevice > captureDeviceList.size())
+		selectedDevice = 0;
+	if (ImGui::BeginCombo(cstr("CaptureDevice"), captureDeviceList.at(selectedDevice).c_str(), 0))
+	{
+
+		int index = 0;
+		for (auto &device : captureDeviceList)
+		{
+			if (ImGui::Selectable(device.c_str(), selectedDevice == index, 0))
+			{
+				selectedDevice = index;
+			}
+			index++;
+		}
+
+		ImGui::EndCombo();
+	}
+	m_Audio.SetCaptureDevice(selectedDevice);
+#endif
+
+	if (!scePadSettings.audioPassthrough && wasChecked)
+	{
+		wasChecked = false;
+		if (!m_Audio.StopByUserId(currentController + 1))
+		{
+			LOGE("Failed to stop audio passthrough");
+		}
+	}
+
+	if (scePadSettings.audioPassthrough && !wasChecked)
+	{
+		wasChecked = true;
+		if (!m_Audio.StartByUserId(currentController + 1))
+		{
+			LOGE("Failed to start audio passthrough");
+			scePadSettings.audioPassthrough = false;
+			failedToStart = true;
+		}
+		else
+		{
+			failedToStart = false;
+		}
+	}
+
+	if (failedToStart)
+	{
+		ImGui::SameLine();
+#ifdef WINDOWS
+		ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("Failed to start"));
+#else
+		ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("Audio passthrough is not available on this platform"));
+#endif
+	}
+	else if (!failedToStart && scePadSettings.audioPassthrough)
+	{
+		ImGui::SetNextItemWidth(400);
+		ImGui::SliderFloat(cstr("HapticsIntensity"), &scePadSettings.hapticIntensity, 0.0f, 5.0f);
+	}
+
+	if (ImGui::TreeNode(cstr("AudioOutputPath")))
+	{
+		ImGui::RadioButton(cstr("StereoHeadset"), &scePadSettings.audioPath, SCE_PAD_AUDIO_PATH_STEREO_HEADSET);
+		ImGui::RadioButton(cstr("MonoLeftHeadset"), &scePadSettings.audioPath, SCE_PAD_AUDIO_PATH_MONO_LEFT_HEADSET);
+		ImGui::RadioButton(cstr("MonoLeftHeadsetAndSpeaker"), &scePadSettings.audioPath, SCE_PAD_AUDIO_PATH_MONO_LEFT_HEADSET_AND_SPEAKER);
+		ImGui::RadioButton(cstr("OnlySpeaker"), &scePadSettings.audioPath, SCE_PAD_AUDIO_PATH_ONLY_SPEAKER);
+		ImGui::TreePop();
+	}
+
+	ImGui::SetNextItemWidth(400);
+	ImGui::SliderInt(cstr("SpeakerVolume"), &scePadSettings.speakerVolume, 0, 8, "%d");
+	ImGui::SetNextItemWidth(400);
+	ImGui::SliderInt(cstr("MicrophoneGain"), &scePadSettings.micGain, 0, 8, "%d");
+	return true;
+}
+
+static std::vector<std::string> sonyItems = {TriggerStringSony::OFF, TriggerStringSony::FEEDBACK, TriggerStringSony::WEAPON, TriggerStringSony::VIBRATION, TriggerStringSony::SLOPE_FEEDBACK, TriggerStringSony::MULTIPLE_POSITION_FEEDBACK, TriggerStringSony::MULTIPLE_POSITION_VIBRATION};
+static std::vector<std::string> dsxItems = {TriggerStringDSX::Normal, TriggerStringDSX::GameCube, TriggerStringDSX::VerySoft, TriggerStringDSX::Soft, TriggerStringDSX::Medium, TriggerStringDSX::Hard, TriggerStringDSX::VeryHard, TriggerStringDSX::Hardest, TriggerStringDSX::VibrateTrigger, TriggerStringDSX::VibrateTriggerPulse, TriggerStringDSX::Choppy, TriggerStringDSX::CustomTriggerValue, TriggerStringDSX::Resistance, TriggerStringDSX::Bow, TriggerStringDSX::Galloping, TriggerStringDSX::SemiAutomaticGun, TriggerStringDSX::AutomaticGun, TriggerStringDSX::Machine, TriggerStringDSX::VIBRATE_TRIGGER_10Hz};
+bool MainWindow::AdaptiveTriggers(s_scePadSettings &scePadSettings)
+{
+	if (m_Udp.IsActive())
+		return false;
+
+	ImGui::SeparatorText(cstr("AdaptiveTriggers"));
+
+	if (ImGui::TreeNodeEx(cstr("StaticTriggerSettings")))
+	{
+		ImGui::Text(cstr("SelectedTrigger"));
+		ImGui::RadioButton("L2", &scePadSettings.uiSelectedTrigger, L2);
+		ImGui::SameLine();
+		ImGui::RadioButton("R2", &scePadSettings.uiSelectedTrigger, R2);
+
+		ImGui::Text(cstr("TriggerFormat"));
+		ImGui::RadioButton("Sony", &scePadSettings.uiTriggerFormat[scePadSettings.uiSelectedTrigger], SONY_FORMAT);
+		ImGui::SameLine();
+		ImGui::RadioButton("DSX", &scePadSettings.uiTriggerFormat[scePadSettings.uiSelectedTrigger], DSX_FORMAT);
+
+		int currentlySelectedTrigger = scePadSettings.uiSelectedTrigger;
+		int currentTriggerFormat = scePadSettings.uiTriggerFormat[currentlySelectedTrigger];
+
+		ImGui::SetNextItemWidth(450);
+		if (ImGui::BeginCombo(cstr("TriggerMode"), currentTriggerFormat == SONY_FORMAT ? scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger].c_str()
+																					   : scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger].c_str()))
+		{
+			std::vector<std::string> &items = (currentTriggerFormat == SONY_FORMAT) ? sonyItems : dsxItems;
+			int &currentItem = (currentTriggerFormat == SONY_FORMAT) ? scePadSettings.currentSonyItem[currentlySelectedTrigger] : scePadSettings.currentDSXItem[currentlySelectedTrigger];
+
+			for (int i = 0; i < items.size(); i++)
+			{
+				bool isSelected = (currentItem == i);
+				if (ImGui::Selectable(items[i].c_str(), isSelected))
+				{
+					currentItem = i;
+				}
+			}
+			ImGui::EndCombo();
+		}
+
+		if (currentTriggerFormat == SONY_FORMAT)
+		{
+			scePadSettings.isLeftUsingDsxTrigger = currentlySelectedTrigger == L2 ? false : scePadSettings.isLeftUsingDsxTrigger;
+			scePadSettings.isRightUsingDsxTrigger = currentlySelectedTrigger == R2 ? false : scePadSettings.isRightUsingDsxTrigger;
+			scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] = sonyItems[scePadSettings.currentSonyItem[currentlySelectedTrigger]];
+		}
+		else
+		{
+			scePadSettings.isLeftUsingDsxTrigger = currentlySelectedTrigger == L2 ? true : scePadSettings.isLeftUsingDsxTrigger;
+			scePadSettings.isRightUsingDsxTrigger = currentlySelectedTrigger == R2 ? true : scePadSettings.isRightUsingDsxTrigger;
+			scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] = dsxItems[scePadSettings.currentDSXItem[currentlySelectedTrigger]];
+		}
+
+		if (scePadSettings.uiTriggerFormat[currentlySelectedTrigger] == SONY_FORMAT)
+		{
+			if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::FEEDBACK)
+			{
+				int &position = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &strength = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+
+				if (position > 9)
+					position = 9;
+				if (strength < 1)
+					strength = 1;
+				if (strength > 8)
+					strength = 8;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Position"), &position, 0, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Strength"), &strength, 1, 8);
+			}
+			else if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::WEAPON)
+			{
+				int &startPosition = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &endPosition = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &strength = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+
+				if (startPosition < 2)
+					startPosition = 2;
+				if (startPosition > 7)
+					startPosition = 7;
+				if (endPosition > 8)
+					endPosition = 8;
+				if (strength < 1)
+					strength = 1;
+				if (strength > 8)
+					strength = 8;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("StartPosition"), &startPosition, 2, 7);
+				ImGui::SetNextItemWidth(450);
+				if (startPosition >= endPosition)
+					endPosition = startPosition + 1;
+				ImGui::SliderInt(cstr("EndPosition"), &endPosition, scePadSettings.uiParameters[currentlySelectedTrigger][0] + 1, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Strength"), &strength, 1, 8);
+			}
+			else if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::VIBRATION)
+			{
+				int &position = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &amplitude = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &frequency = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+
+				if (position > 9)
+					position = 9;
+				if (amplitude < 1)
+					amplitude = 1;
+				if (amplitude > 8)
+					amplitude = 8;
+				if (frequency < 1)
+					frequency = 1;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Position"), &position, 0, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Amplitude"), &amplitude, 1, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Frequency"), &frequency, 1, 255);
+			}
+			else if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::SLOPE_FEEDBACK)
+			{
+				int &startPosition = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &endPosition = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &startStrength = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+				int &endStrength = scePadSettings.uiParameters[currentlySelectedTrigger][3];
+
+				if (startPosition < 1)
+					startPosition = 1;
+				if (startPosition > 8)
+					startPosition = 8;
+				if (endPosition <= startPosition)
+					endPosition = startPosition + 1;
+				if (endPosition > 9)
+					endPosition = 9;
+				if (startStrength > 8)
+					startStrength = 8;
+				if (startStrength < 1)
+					startStrength = 1;
+				if (endStrength < 1)
+					endStrength = 1;
+				if (endStrength > 8)
+					endStrength = 8;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("StartPosition"), &startPosition, 1, endPosition - 1);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("EndPosition"), &endPosition, startPosition + 1, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("StartStrength"), &startStrength, 1, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("EndStrength"), &endStrength, 1, 8);
+			}
+			else if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::MULTIPLE_POSITION_FEEDBACK)
+			{
+				std::string strengthStr = cstr("Strength");
+				for (int i = 0; i < 10; ++i)
+				{
+					if (scePadSettings.uiParameters[currentlySelectedTrigger][i] > 8)
+						scePadSettings.uiParameters[currentlySelectedTrigger][i] = 8;
+					ImGui::SetNextItemWidth(450);
+					ImGui::SliderInt(std::string(strengthStr + " " + std::to_string(i + 1)).c_str(), &scePadSettings.uiParameters[currentlySelectedTrigger][i], 0, 8);
+				}
+			}
+			else if (scePadSettings.uiSelectedSonyTriggerMode[currentlySelectedTrigger] == TriggerStringSony::MULTIPLE_POSITION_VIBRATION)
+			{
+				std::string amplitudeStr = cstr("Amplitude");
+				int &frequency = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(amplitudeStr.c_str(), &frequency, 0, 255);
+				for (int i = 1; i < 11; ++i)
+				{
+					if (scePadSettings.uiParameters[currentlySelectedTrigger][i] > 8)
+						scePadSettings.uiParameters[currentlySelectedTrigger][i] = 8;
+					ImGui::SetNextItemWidth(450);
+					ImGui::SliderInt(std::string(amplitudeStr + " " + std::to_string(i)).c_str(), &scePadSettings.uiParameters[currentlySelectedTrigger][i], 0, 8);
+				}
+			}
+		}
+		else
+		{
+			if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::CustomTriggerValue)
+			{
+				static const std::vector<std::string> customTriggerList = {"Off", "Rigid", "Rigid_A", "Rigid_B", "Rigid_AB", "Pulse", "Pulse_A", "Pulse_B", "Pulse_AB"};
+				int &currentlySelectedCustomTrigger = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				if (currentlySelectedCustomTrigger > customTriggerList.size())
+					currentlySelectedCustomTrigger = customTriggerList.size() - 1;
+
+				ImGui::SetNextItemWidth(450);
+				if (ImGui::BeginCombo(cstr("CustomTriggerMode"), customTriggerList[currentlySelectedCustomTrigger].c_str()))
+				{
+					for (int i = 0; i < customTriggerList.size(); i++)
+					{
+						bool isSelected = (currentlySelectedCustomTrigger == i);
+						if (ImGui::Selectable(customTriggerList[i].c_str(), isSelected))
+						{
+							currentlySelectedCustomTrigger = i;
+						}
+					}
+
+					ImGui::EndCombo();
+				}
+
+				std::string paramStr = cstr("Parameter");
+				for (int i = 1; i < MAX_PARAM_COUNT; i++)
+				{
+					ImGui::SetNextItemWidth(450);
+					ImGui::SliderInt(std::string(paramStr + " " + std::to_string(i)).c_str(), &scePadSettings.uiParameters[currentlySelectedTrigger][i], 0, 255);
+				}
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::Resistance)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &force = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+
+				if (start > 9)
+					start = 9;
+				if (force > 8)
+					force = 8;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 0, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Force"), &force, 0, 8);
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::Bow)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &end = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &force = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+				int &snapForce = scePadSettings.uiParameters[currentlySelectedTrigger][3];
+
+				if (start > 8)
+					start = 8;
+				if (start >= end)
+					end = start + 1;
+				if (end > 8)
+					end = 8;
+				if (force > 8)
+					force = 8;
+				if (snapForce > 8)
+					snapForce = 8;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 0, 7);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("End"), &end, start + 1, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Force"), &force, 0, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("SnapForce"), &snapForce, 0, 8);
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::Galloping)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &end = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &firstFoot = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+				int &secondFoot = scePadSettings.uiParameters[currentlySelectedTrigger][3];
+				int &frequency = scePadSettings.uiParameters[currentlySelectedTrigger][4];
+
+				if (start > 8)
+					start = 8;
+				if (end > 9)
+					end = 9;
+				if (firstFoot > 7)
+					firstFoot = 7;
+				if (secondFoot > 6)
+					secondFoot = 6;
+				if (frequency < 1)
+					frequency = 1;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 0, end - 1);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("End"), &end, start, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("FirstFoot"), &firstFoot, 0, secondFoot);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("SecondFoot"), &secondFoot, firstFoot, 6);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Frequency"), &frequency, 0, 255);
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::SemiAutomaticGun)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &end = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &force = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+
+				if (start < 2)
+					start = 2;
+				if (start > 7)
+					start = 7;
+				if (end > 8)
+					end = 8;
+				if (end < start)
+					end = start + 1;
+				if (force > 8)
+					force = 8;
+				if (force < 1)
+					force = 1;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 2, end - 1);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("End"), &end, start, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Force"), &force, 1, 8);
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::AutomaticGun)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &strength = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &frequency = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+
+				if (start > 9)
+					start = 9;
+				if (strength > 8)
+					strength = 8;
+				if (strength < 1)
+					strength = 1;
+				if (frequency < 1)
+					frequency = 1;
+
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 0, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Strength"), &strength, 1, 8);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Frequency"), &frequency, 1, 255);
+			}
+			else if (scePadSettings.uiSelectedDSXTriggerMode[currentlySelectedTrigger] == TriggerStringDSX::Machine)
+			{
+				int &start = scePadSettings.uiParameters[currentlySelectedTrigger][0];
+				int &end = scePadSettings.uiParameters[currentlySelectedTrigger][1];
+				int &strengthA = scePadSettings.uiParameters[currentlySelectedTrigger][2];
+				int &strengthB = scePadSettings.uiParameters[currentlySelectedTrigger][3];
+				int &frequency = scePadSettings.uiParameters[currentlySelectedTrigger][4];
+				int &period = scePadSettings.uiParameters[currentlySelectedTrigger][5];
+
+				if (start > 8)
+					start = 8;
+				if (end > 9)
+					end = 9;
+				if (end < start)
+					end = start + 1;
+				if (strengthA > 7)
+					strengthA = 7;
+				if (strengthB > 7)
+					strengthB = 7;
+				if (frequency < 1)
+					frequency = 7;
+
+				std::string strStrength = cstr("Strength");
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Start"), &start, 0, end - 1);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("End"), &end, start, 9);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(std::string(strStrength + " A").c_str(), &strengthA, 0, 7);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(std::string(strStrength + " B").c_str(), &strengthB, 0, 7);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Frequency"), &frequency, 0, 255);
+				ImGui::SetNextItemWidth(450);
+				ImGui::SliderInt(cstr("Period"), &period, 0, 255);
+			}
+		}
+
+		ImGui::TreePop();
+	}
+	return true;
+}
+
+bool MainWindow::KeyboardAndMouseMapping(s_scePadSettings &scePadSettings, s_ScePadData &state)
+{
+	enum class HotkeyDestination
+	{
+		LEFTMOUSE,
+		GYROTOMOUSE
+	};
+
+	static HotkeyDestination hotkeyDestination;
+	static std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now() - std::chrono::seconds(3);
+	auto now = std::chrono::steady_clock::now();
+	static bool wasClicked = false;
+
+	bool isHotkeyOpen = false;
+
+	auto remainingTime = now - time;
+	if (remainingTime < std::chrono::seconds(3))
+	{
+		isHotkeyOpen = true;
+	}
+	else if (remainingTime > std::chrono::seconds(3) && wasClicked)
+	{
+		wasClicked = false;
+		if (state.bitmask_buttons != 0)
+		{
+			if (hotkeyDestination == HotkeyDestination::LEFTMOUSE)
+				scePadSettings.mouse1Hotkey = state.bitmask_buttons;
+			else if (hotkeyDestination == HotkeyDestination::GYROTOMOUSE)
+				scePadSettings.gyroMouseHotkey = state.bitmask_buttons;
+		}
+	}
+
+	ImGui::SeparatorText(cstr("KeyboardAndMouseMapping"));
+	ImGui::Checkbox(cstr("AnalogWsadEmulation"), &scePadSettings.emulateAnalogWsad);
+	ImGui::Checkbox(cstr("PsBtnAsWinKey"), &scePadSettings.psBtnAsWinKey);
+
+	ImGui::Checkbox(cstr("GyroToMouse"), &scePadSettings.gyroToMouse);
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(350);
+	ImGui::SliderFloat(std::string(strr("Sensitivity") + "##gyrotomouse").c_str(), &scePadSettings.gyroToMouseSensitivity, 0, 2);
+
+	ImGui::Checkbox(cstr("GyroToMouseHotkey"), &scePadSettings.useGyroMouseHotkey);
+	ImGui::SameLine();
+	if (ImGui::Button(std::string(GetFormattedActiveButtonNames(scePadSettings.gyroMouseHotkey) + "##kb").c_str()))
+	{
+		time = now;
+		wasClicked = true;
+		hotkeyDestination = HotkeyDestination::GYROTOMOUSE;
+	}
+
+	ImGui::Checkbox(cstr("LeftMouseHotkey"), &scePadSettings.useMouse1Hotkey);
+	ImGui::SameLine();
+	if (ImGui::Button(std::string(GetFormattedActiveButtonNames(scePadSettings.mouse1Hotkey) + "##kb").c_str()))
+	{
+		time = now;
+		wasClicked = true;
+		hotkeyDestination = HotkeyDestination::LEFTMOUSE;
+	}
+
+	GetHotkeyFromControllerScreen(&isHotkeyOpen, static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(remainingTime).count()), 3);
+
+	return true;
+}
+
+bool MainWindow::Touchpad(int currentController, s_scePadSettings &scePadSettings, s_ScePadData &state, float scale)
+{
+	ImGui::SeparatorText(cstr("Touchpad"));
+
+	ImGui::Checkbox(cstr("TouchpadToMouse"), &scePadSettings.touchpadAsMouse);
+	if (scePadSettings.touchpadAsMouse)
+	{
+		ImGui::SetNextItemWidth(400);
+		ImGui::SliderFloat(std::string(strr("Sensitivity") + "##touchpad").c_str(), &scePadSettings.touchpadAsMouse_sensitivity, 0.0f, 5.0f);
+	}
+	TreeElement_touchpadDiagnostics(currentController, scePadSettings, state, scale);
+
+	return true;
+}
+
+bool MainWindow::TreeElement_touchpadDiagnostics(int currentController, s_scePadSettings &scePadSettings, s_ScePadData &state, float scale)
+{
+
+	if (ImGui::TreeNodeEx(cstr("Diagnostics")))
+	{
+		ImVec2 touchpadSize(
+			1.160 * scale,
+			0.520 * scale);
+		ImGui::InvisibleButton("##touchpad_bg", touchpadSize);
+		ImDrawList *drawList = ImGui::GetWindowDrawList();
+		ImVec2 touchpadPos = ImGui::GetItemRectMin();
+		drawList->AddRectFilled(touchpadPos,
+								ImVec2(touchpadPos.x + touchpadSize.x,
+									   touchpadPos.y + touchpadSize.y),
+								IM_COL32(state.bitmask_buttons & SCE_BM_TOUCH ? 200 : 50, 50, 50, 255));
+
+		s_ScePadInfo info = {};
+		scePadGetControllerInformation(g_ScePad[currentController], &info);
+
+		auto drawFinger = [&](float x, float y, int id, bool notTouching)
+		{
+			if (!notTouching)
+			{
+				float scaledX = touchpadPos.x + (x / (float)info.touchPadInfo.resolution.x) * touchpadSize.x;
+				float scaledY = touchpadPos.y + (y / (float)info.touchPadInfo.resolution.y) * touchpadSize.y;
+				drawList->AddCircleFilled(ImVec2(scaledX, scaledY), 0.02f * scale, IM_COL32(255, 0, 0, 255));
+
+				ImGui::GetWindowDrawList()->AddText(ImVec2(scaledX - 20, scaledY), IM_COL32(255, 255, 255, 255), std::to_string(id).c_str());
+				ImGui::GetWindowDrawList()->AddText(ImVec2(scaledX - 50, scaledY - 38), IM_COL32(255, 255, 255, 255), std::string(std::to_string((int)x) + "," + std::to_string((int)y)).c_str());
+			}
+		};
+
+		drawFinger((float)state.touchData.touch[0].x, (float)state.touchData.touch[0].y, state.touchData.touch[0].id, state.touchData.touch[0].reserve[0]);
+		drawFinger((float)state.touchData.touch[1].x, (float)state.touchData.touch[1].y, state.touchData.touch[1].id, state.touchData.touch[1].reserve[0]);
+
+		ImGui::TreePop();
+	}
+
+	return true;
+}
+
+bool MainWindow::TreeElement_lightbar(s_scePadSettings &scePadSettings)
+{
+	if (ImGui::TreeNodeEx(cstr("Lightbar")))
+	{
+		ImGui::Checkbox(cstr("UseEmulatedLightbar"), &scePadSettings.useLightbarFromEmulatedController);
+		ImGui::TreePop();
+	}
+
+	return true;
+}
+
+bool MainWindow::TreeElement_vibration(s_scePadSettings &scePadSettings)
+{
+	if (ImGui::TreeNodeEx(cstr("Vibration")))
+	{
+		ImGui::Checkbox(cstr("UseEmulatedVibration"), &scePadSettings.useRumbleFromEmulatedController);
+		ImGui::TreePop();
+	}
+
+	return true;
+}
+
+bool MainWindow::TreeElement_dynamicAdaptiveTriggers(s_scePadSettings &scePadSettings, int currentController)
+{
+	if (ImGui::TreeNodeEx(cstr("DynamicTriggerSettings")))
+	{
+		// --- Haptics to adaptive triggers ---
+		ImGui::SeparatorText(cstr("HapticsToAdaptiveTriggers"));
+		ImGui::Checkbox(cstr("HapticsToAdaptiveTriggers"), &scePadSettings.hapticsToAt);
+		if (scePadSettings.hapticsToAt)
+		{
+			if (!scePadSettings.audioPassthrough)
+			{
+				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "%s", cstr("HapticsAtAudioPassthroughNotice"));
+			}
+
+			ImGui::SetNextItemWidth(400);
+			ImGui::SliderFloat(cstr("HapticsAtStrength"), &scePadSettings.hapticsToAt_intensity, 0.1f, 2.0f, "%.2fx");
+
+			ImGui::Text("%s:", cstr("HapticsAtMode"));
+			ImGui::SameLine();
+			ImGui::RadioButton(cstr("HapticsAtModeVibration"), &scePadSettings.hapticsToAt_mode, 0);
+			ImGui::SameLine();
+			ImGui::RadioButton(cstr("HapticsAtModeResistance"), &scePadSettings.hapticsToAt_mode, 1);
+
+			ImGui::Checkbox(cstr("HapticsAtSwapTriggers"), &scePadSettings.hapticsToAt_swapTriggers);
+
+			// Real-time visual progress bars for L2 and R2
+			float rawL = m_Audio.GetHapticLevelL(currentController + 1);
+			float rawR = m_Audio.GetHapticLevelR(currentController + 1);
+			float dispL = scePadSettings.hapticsToAt_swapTriggers ? rawR : rawL;
+			float dispR = scePadSettings.hapticsToAt_swapTriggers ? rawL : rawR;
+			dispL = std::clamp(dispL * scePadSettings.hapticsToAt_intensity, 0.0f, 1.0f);
+			dispR = std::clamp(dispR * scePadSettings.hapticsToAt_intensity, 0.0f, 1.0f);
+
+			char bufL[32];
+			char bufR[32];
+			snprintf(bufL, sizeof(bufL), "%.0f%%", dispL * 100.0f);
+			snprintf(bufR, sizeof(bufR), "%.0f%%", dispR * 100.0f);
+
+			ImGui::Text("L2:");
+			ImGui::SameLine();
+			ImGui::ProgressBar(dispL, ImVec2(180, 0), bufL);
+			ImGui::SameLine();
+			ImGui::Text("R2:");
+			ImGui::SameLine();
+			ImGui::ProgressBar(dispR, ImVec2(180, 0), bufR);
+		}
+
+		// --- Rumble to adaptive triggers & Triggers as buttons ---
+		ImGui::SeparatorText(cstr("RumbleToAT"));
+		ImGui::Checkbox(cstr("TriggersAsButtons"), &scePadSettings.triggersAsButtons);
+
+		if (scePadSettings.triggersAsButtons)
+		{
+			ImGui::SetNextItemWidth(400);
+			ImGui::SliderInt(cstr("StartPosition"), &scePadSettings.triggersAsButtonStartPos, 0, 255);
+		}
+		else
+		{
+			ImGui::Checkbox(cstr("RumbleToAT"), &scePadSettings.rumbleToAT);
+			if (scePadSettings.rumbleToAT)
+			{
+				if (scePadSettings.hapticsToAt && scePadSettings.audioPassthrough)
+				{
+					ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "%s", cstr("HapticsAtPriorityNotice"));
+				}
+				ImGui::Checkbox(cstr("SwapTriggersRumbleToAT"), &scePadSettings.rumbleToAt_swapTriggers);
+			}
+
+			static int selectedTrigger = SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_L2;
+			auto rumbleToAtSetting = [&](int &selectedTrigger)
+			{
+				ImGui::SetNextItemWidth(400);
+				ImGui::SliderInt(cstr("MaxFrequency"), &scePadSettings.rumbleToAt_frequency[selectedTrigger], 0, 255);
+				ImGui::SetNextItemWidth(400);
+				ImGui::SliderInt(cstr("MaxIntensity"), &scePadSettings.rumbleToAt_intensity[selectedTrigger], 0, 255);
+				ImGui::SetNextItemWidth(400);
+				ImGui::SliderInt(cstr("Position"), &scePadSettings.rumbleToAt_position[selectedTrigger], 0, 139);
+			};
+
+			ImGui::RadioButton("L2", &selectedTrigger, 0);
+			ImGui::SameLine();
+			ImGui::RadioButton("R2", &selectedTrigger, 1);
+			rumbleToAtSetting(selectedTrigger);
+		}
+
+		ImGui::TreePop();
+	}
+	return true;
+}
+
+bool MainWindow::TreeElement_motion(s_scePadSettings &scePadSettings, s_ScePadData &state, int currentController)
+{
+	static std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now() - std::chrono::seconds(3);
+	auto now = std::chrono::steady_clock::now();
+	static bool wasClicked = false;
+
+	if (ImGui::TreeNodeEx(cstr("Motion")))
+	{
+		if (ImGui::Checkbox(cstr("GyroToRightStick"), &scePadSettings.gyroToRightStick))
+		{
+			if (currentController >= 0 && currentController < 4)
+			{
+				bool ledState = scePadSettings.gyroToRightStick && scePadSettings.gyroToRightStickPermanent;
+				scePadSetMicLed(g_ScePad[currentController], ledState);
+			}
+		}
+		if (scePadSettings.gyroToRightStick)
+		{
+			if (ImGui::Checkbox(std::string(strr("GyroMicGate") + "##micgate").c_str(), &scePadSettings.gyroToRightStickPermanent))
+			{
+				if (currentController >= 0 && currentController < 4)
+				{
+					bool ledState = scePadSettings.gyroToRightStick && scePadSettings.gyroToRightStickPermanent;
+					scePadSetMicLed(g_ScePad[currentController], ledState);
+				}
+			}
+			ImGui::SameLine();
+			bool hasHotkey = scePadSettings.useGyroRightStickHotkey && (scePadSettings.gyroToRightStickActivationButton != 0);
+			if (scePadSettings.gyroToRightStickPermanent)
+			{
+				if (hasHotkey)
+				{
+					std::string actBtn = GetFormattedActiveButtonNames(scePadSettings.gyroToRightStickActivationButton);
+					if (actBtn.empty()) actBtn = "L2";
+					char buf[128];
+					snprintf(buf, sizeof(buf), strr("GyroArmedStatus").c_str(), actBtn.c_str());
+					ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", buf);
+				}
+				else
+				{
+					ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", cstr("GyroAlwaysActiveStatus"));
+				}
+			}
+			else
+			{
+				ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.35f, 1.0f), "%s", cstr("GyroDisarmedStatus"));
+			}
+		}
+
+		ImGui::Checkbox(cstr("UseHotkey"), &scePadSettings.useGyroRightStickHotkey);
+		if (scePadSettings.useGyroRightStickHotkey)
+		{
+			ImGui::SameLine();
+			ImGui::Text(std::string(strr("SetActivationButton") + ": ").c_str());
+			ImGui::SameLine();
+
+			bool isHotkeyOpen = false;
+			std::string btnName = GetFormattedActiveButtonNames(scePadSettings.gyroToRightStickActivationButton);
+			if (btnName.empty()) btnName = strr("None");
+			if (ImGui::Button(std::string(btnName + "##hotkeybtn").c_str()))
+			{
+				time = now;
+				wasClicked = true;
+			}
+
+			ImGui::SameLine();
+			if (ImGui::Button("X##cleargps"))
+			{
+				scePadSettings.gyroToRightStickActivationButton = 0;
+			}
+			if (ImGui::IsItemHovered())
+			{
+				ImGui::SetTooltip("Clear activation button (None)");
+			}
+
+			auto remainingTime = now - time;
+			if (remainingTime < std::chrono::seconds(3))
+			{
+				isHotkeyOpen = true;
+			}
+			else if (remainingTime > std::chrono::seconds(3) && wasClicked)
+			{
+				wasClicked = false;
+				if (state.bitmask_buttons != 0)
+					scePadSettings.gyroToRightStickActivationButton = state.bitmask_buttons;
+			}
+
+			GetHotkeyFromControllerScreen(&isHotkeyOpen, static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(remainingTime).count()), 3);
+		}
+
+		ImGui::SetNextItemWidth(350);
+		ImGui::SliderFloat(std::string(strr("Sensitivity") + "##gyrotorightstick").c_str(), &scePadSettings.gyroToRightStickSensitivity, 0, 2);
+		ImGui::SetNextItemWidth(350);
+		ImGui::SliderInt(cstr("Deadzone"), &scePadSettings.gyroToRightStickDeadzone, 0, 255);
+
+		ImGui::TreePop();
+	}
+	return true;
+}
+
+bool MainWindow::TreeElement_touchpad(s_scePadSettings &scePadSettings)
+{
+	if (ImGui::TreeNodeEx(cstr("Touchpad")))
+	{
+
+		ImGui::Checkbox(cstr("TouchpadAsSelect"), &scePadSettings.TouchpadAsSelect);
+		ImGui::Checkbox(cstr("TouchpadAsStart"), &scePadSettings.TouchpadAsStart);
+
+		ImGui::TreePop();
+	}
+	return true;
+}
+
+bool MainWindow::TreeElement_sharebtn(s_scePadSettings &scePadSettings)
+{
+	if (ImGui::TreeNodeEx(cstr("ShareButton")))
+	{
+		ImGui::Checkbox(cstr("ShareButtonAsSelect"), &scePadSettings.ShareBtnAsSelect);
+		ImGui::TreePop();
+	}
+	return true;
+}
+
+bool MainWindow::Online(s_scePadSettings &scePadSettings)
+{
+	static bool showMsgFromServer = false;
+	SCMD::CMD_CODE_RESPONSE currentResponse = m_Client.GetLastResponseInQueue();
+
+	if (!m_Client.IsResponseQueueEmpty() && currentResponse.Code != RESPONSE_CODE::E_SUCCESS)
+	{
+		showMsgFromServer = true;
+
+		if (MessageFromServer(&showMsgFromServer, &currentResponse))
+		{
+			m_Client.PopBackResponseQueue();
+		}
+	}
+	else
+	{
+		showMsgFromServer = false;
+	}
+
+	bool fetchingFromServer = m_Client.IsFetchingDataFromServer();
+	bool fetchingFromPeer = m_Client.IsFetchingDataFromPeer();
+
+	ScreenBlock(fetchingFromServer, cstr("FetchingFromServer"), "Block_Server");
+	ScreenBlock(fetchingFromPeer, cstr("FetchingFromPeer"), "Block_Peer");
+
+	ImGui::SeparatorText(cstr("Online"));
+
+	if (m_Client.IsConnectionOccupied())
+	{
+		ImGui::Text(cstr("FailedToCreateHost"));
+		return false;
+	}
+
+	if (!m_Client.IsConnected())
+	{
+
+		if (m_Client.IsConnecting())
+			ImGui::Text(cstr("ConnectingToServer"));
+		else if (!m_Client.IsUpToDate())
+		{
+			ImGui::Text(cstr("UpdateRequiredToConnectMsg"));
+			if (ImGui::Button(cstr("Update")))
+			{
+				std::string updateUrl = m_Client.GetUpdateUrl();
+				std::filesystem::path filePath("Updater.exe");
+				if (std::filesystem::exists(filePath) && updateUrl != "")
+				{
+					TinyProcessLib::Process process("Updater.exe --" + updateUrl + " update.zip");
+				}
+				std::exit(0);
+			}
+		}
+		else if (ImGui::Button(cstr("ConnectOnline")))
+			m_Client.Connect(m_AppSettings.ServerAddress, m_AppSettings.ServerPort);
+	}
+	else
+	{
+		ImGui::Text("%s: %d", cstr("UsersOnline"), (int)m_Client.GetGlobalPeerCount());
+
+		if (!m_Client.IsInRoom())
+		{
+			static char buf[MAX_ROOM_NAME_SIZE] = {0};
+			ImGui::SetNextItemWidth(250);
+			ImGui::InputText(cstr("RoomName"), buf, MAX_ROOM_NAME_SIZE);
+			std::string roomName = std::string(buf, strnlen(buf, MAX_ROOM_NAME_SIZE));
+
+			if (ImGui::Button(cstr("CreateRoom")))
+			{
+				m_Client.CMD_OPEN_ROOM(roomName.c_str());
+			}
+			ImGui::SameLine();
+			if (ImGui::Button(cstr("JoinRoom")))
+			{
+				m_Client.CMD_JOIN_ROOM(roomName.c_str());
+			}
+		}
+		else
+		{
+			static bool showRoomName = false;
+			if (showRoomName)
+				ImGui::Text("%s: %s", cstr("Room"), m_Client.GetRoomName().c_str());
+			else if (ImGui::Button(cstr("ShowRoomName")))
+				showRoomName = true;
+
+			ImGui::SameLine();
+			if (ImGui::Button(cstr("LeaveRoom")))
+			{
+				m_Client.CMD_LEAVE_ROOM();
+			}
+
+			auto peers = m_Client.GetPeerList();
+			if (!peers.empty())
+			{
+				for (auto &peer : peers)
+				{
+					ImGui::Text("[%d] %s - %d ms", peer.first, peer.second.c_str(), m_Client.GetPingFromPeer(peer.first));
+					ImGui::SameLine();
+
+					auto requestStatus = m_Client.GetRequestStatus(peer.first);
+
+					if (requestStatus == PEER_REQUEST_STATUS::PEER_WAITING_FOR_MY_RESPONSE)
+					{
+						ImGui::Text("[%s]", cstr("NewControllerRequest"));
+						ImGui::SameLine();
+						if (ImGui::SmallButton(cstr("Accept")))
+						{
+							m_Client.AcceptPeerRequest(peer.first);
+						}
+						ImGui::SameLine();
+						if (ImGui::SmallButton(cstr("Decline")))
+						{
+							m_Client.DeclinePeerRequest(peer.first);
+						}
+					}
+					else if (requestStatus == PEER_REQUEST_STATUS::WAITING_FOR_PEER_RESPONSE)
+					{
+						ImGui::Text(cstr("WaitingForPeerResponse"));
+					}
+					else if (requestStatus == PEER_REQUEST_STATUS::ME_TRANSMITTING_TO_PEER)
+					{
+						ImGui::TextColored(ImVec4(0, 1, 0, 1), cstr("TransmitingToPeer"));
+						ImGui::SameLine();
+						if (ImGui::SmallButton(cstr("Abort")))
+							m_Client.CMD_PEER_ABORT_VIGEM(peer.first);
+					}
+					else if (requestStatus == PEER_REQUEST_STATUS::PEER_TRANSMITING_TO_ME)
+					{
+						ImGui::TextColored(ImVec4(0, 1, 0, 1), cstr("PeerTransmitingToYou"));
+						ImGui::SameLine();
+						if (ImGui::SmallButton(cstr("Abort")))
+							m_Client.CMD_PEER_ABORT_VIGEM(peer.first);
+					}
+					else
+					{
+						if (requestStatus == PEER_REQUEST_STATUS::PEER_DECLINED)
+						{
+							ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("PeerDeclined"));
+						}
+						ImGui::SameLine();
+
+						if (ImGui::SmallButton(cstr("RequestX360")))
+						{
+							m_Client.CMD_PEER_REQUEST_VIGEM(peer.first, CONTROLLER::XBOX360);
+						}
+						ImGui::SameLine();
+						if (ImGui::SmallButton(cstr("RequestDS4")))
+						{
+							m_Client.CMD_PEER_REQUEST_VIGEM(peer.first, CONTROLLER::DUALSHOCK4);
+						}
+					}
+				}
+			}
+			else
+			{
+				ImGui::Text(cstr("AwaitingForPeerToJoin"));
+			}
+		}
+
+		ImGui::Separator();
+		ImGui::Text(cstr("Configurations"));
+		static char buf[MAX_CONFIG_NAME_SIZE] = {0};
+		ImGui::SetNextItemWidth(250);
+		ImGui::InputText("##empty", buf, MAX_CONFIG_NAME_SIZE);
+		std::string configName = std::string(buf, strnlen(buf, MAX_CONFIG_NAME_SIZE));
+		ImGui::SameLine();
+		if (ImGui::Button(cstr("DownloadConfigByName")))
+		{
+			m_Client.CMD_GET_SCEPADSETTINGS(configName);
+		}
+
+		static bool showFailedToOpenPopup = false;
+		static bool showFailedToLoad = false;
+		ImGui::SameLine();
+		if (ImGui::Button(cstr("SendConfigByFile")))
+		{
+
+			nfdchar_t *outPath = NULL;
+			nfdresult_t result = NFD_OpenDialog("dsy", NULL, &outPath);
+
+			if (result == NFD_OKAY)
+			{
+				std::string outPathString(outPath);
+				if (outPathString.find(".dsy") == std::string::npos)
+				{
+					outPathString += ".dsy";
+				}
+				std::filesystem::path path(outPathString);
+
+				s_scePadSettings settings = {};
+				if (LoadSettingsFromFile(&settings, outPathString))
+					m_Client.CMD_SEND_SCEPADSETTINGS(path.stem().string(), ScePadSettingsToString(&settings));
+				else
+					showFailedToLoad = true;
+				free(outPath);
+			}
+			else
+			{
+				LOGE("Failed to open dialog: %d", result);
+				showFailedToOpenPopup = true;
+			}
+		}
+
+		ScreenBlockClosable(&showFailedToOpenPopup, cstr("FailedToOpenFile"), "Online_File_Open_Fail");
+		ScreenBlockClosable(&showFailedToLoad, cstr("FailedToLoadFile"), "Online_File_Load_Fail");
+
+		auto infos = m_Client.GetFetchedScePadSettingsInfos();
+		static bool shouldFetch = false;
+		static int selectedFetchSetting = -1;
+
+		const std::string currentItemLabel = selectedFetchSetting == -1 ? cstr("SelectOption") : strr(FetchSettingToString((LIST_FETCH_SETTING)selectedFetchSetting));
+
+		ImGui::SetNextItemWidth(400);
+		if (ImGui::BeginCombo(cstr("SortingOption"), currentItemLabel.c_str()))
+		{
+			for (int i = 0; i < (int)LIST_FETCH_SETTING::COUNT; i++)
+			{
+				const bool isSelected = (selectedFetchSetting == i);
+				const std::string itemLabel = strr(FetchSettingToString((LIST_FETCH_SETTING)i));
+
+				if (ImGui::Selectable(itemLabel.c_str(), isSelected))
+				{
+					selectedFetchSetting = i;
+					shouldFetch = true;
+				}
+
+				if (isSelected)
+				{
+					ImGui::SetItemDefaultFocus();
+				}
+			}
+			ImGui::EndCombo();
+		}
+
+		static int page = 0;
+		if ((LIST_FETCH_SETTING)selectedFetchSetting != LIST_FETCH_SETTING::RANDOM && selectedFetchSetting != -1)
+		{
+			if (page > 0)
+			{
+				if (ImGui::Button("<-"))
+				{
+					page--;
+					shouldFetch = true;
+				}
+				ImGui::SameLine();
+			}
+			if (!infos.empty())
+			{
+				if (ImGui::Button("->"))
+				{
+					page++;
+					shouldFetch = true;
+				}
+			}
+			ImGui::SameLine();
+			ImGui::Text("%s: %d", cstr("Page"), page + 1);
+		}
+		else
+		{
+			if (selectedFetchSetting != -1)
+				if (ImGui::Button("Fetch"))
+					shouldFetch = true;
+		}
+
+		if (shouldFetch)
+		{
+			m_Client.CMD_GET_SCEPADSETTINGS_LIST((LIST_FETCH_SETTING)selectedFetchSetting, 10, (LIST_FETCH_SETTING)selectedFetchSetting == LIST_FETCH_SETTING::RANDOM ? 0 : page);
+			shouldFetch = false;
+		}
+
+		static bool shouldApplyFetchedSettings = false;
+		static bool shouldSaveFetchedSettings = false;
+		if (!infos.empty())
+		{
+			if (ImGui::BeginTable("InfoTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+			{
+				ImGui::TableSetupColumn(cstr("Name"), ImGuiTableColumnFlags_WidthStretch, 300.0f);
+				ImGui::TableSetupColumn(cstr("DateUploaded"), ImGuiTableColumnFlags_WidthFixed, 331.0f);
+				ImGui::TableSetupColumn(cstr("Downloads"), ImGuiTableColumnFlags_WidthFixed, 156.0f);
+				ImGui::TableSetupColumn(cstr("Options"), ImGuiTableColumnFlags_WidthFixed, 292.0f);
+				ImGui::TableHeadersRow();
+
+				for (auto &info : infos)
+				{
+					ImGui::TableNextRow();
+
+					ImGui::TableNextColumn();
+					ImGui::TextUnformatted(info.Name);
+
+					std::tm localTime = StringToTimeZone(info.UploadDate, +2);
+					std::ostringstream oss;
+					oss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
+					std::string temp = oss.str();
+					const char *localTimeStr = temp.c_str();
+
+					ImGui::TableNextColumn();
+					ImGui::TextUnformatted(localTimeStr);
+
+					ImGui::TableNextColumn();
+					ImGui::Text("%d", info.DownloadCount);
+
+					ImGui::TableNextColumn();
+
+					if (ImGui::Button(std::string(strr("Apply") + std::string("##") + std::to_string(info.Id)).c_str()))
+					{
+						m_Client.CMD_GET_SCEPADSETTINGS(info.Name);
+						shouldApplyFetchedSettings = true;
+					}
+					ImGui::SameLine();
+					if (ImGui::Button(std::string(strr("SaveToFile") + std::string("##") + std::to_string(info.Id)).c_str()))
+					{
+						m_Client.CMD_GET_SCEPADSETTINGS(info.Name);
+						shouldSaveFetchedSettings = true;
+					}
+				}
+
+				ImGui::EndTable();
+			}
+		}
+
+		static bool failedToApplyFetchedSettings = false;
+		if (shouldApplyFetchedSettings)
+		{
+			std::string settings = m_Client.GetLastFetchedScePadSettings();
+			if (settings != "")
+			{
+				if (!LoadSettingsFromString(&scePadSettings, settings))
+					failedToApplyFetchedSettings = true;
+				else
+					shouldApplyFetchedSettings = false;
+			}
+		}
+
+		static bool failedToSaveFetchedSettings = false;
+		if (shouldSaveFetchedSettings)
+		{
+			std::string settings = m_Client.GetLastFetchedScePadSettings();
+
+			if (settings != "")
+			{
+				nfdchar_t *outPath = NULL;
+				nfdresult_t result = NFD_SaveDialog("dsy", NULL, &outPath);
+
+				if (result == NFD_OKAY)
+				{
+					std::string outPathString(outPath);
+					if (outPathString.find(".dsy") == std::string::npos)
+					{
+						outPathString += ".dsy";
+					}
+					std::filesystem::path path(outPathString);
+
+					if (!SaveSettingsFromString(settings, outPathString))
+						failedToSaveFetchedSettings = true;
+					else
+						failedToSaveFetchedSettings = false;
+
+					free(outPath);
+				}
+			}
+		}
+
+		ScreenBlockClosable(&failedToApplyFetchedSettings, "Failed to apply fetched config", "Online_File_Failed_To_Apply");
+		ScreenBlockClosable(&failedToSaveFetchedSettings, "Failed to save fetched config", "Online_File_Failed_To_Save");
+	}
+
+	return true;
+}
+
+bool MainWindow::MessageFromServer(bool *open, SCMD::CMD_CODE_RESPONSE *Response)
+{
+
+	if (*open)
+	{
+		ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+		ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+		ImGui::OpenPopup(cstr("MessageFromServer"));
+	}
+
+	std::string message = "";
+
+	if (Response->Cmd == CMD::CMD_OPEN_ROOM && Response->Code == RESPONSE_CODE::E_ROOM_ALREADY_EXISTS)
+	{
+		message = strr("ThisRoomAlreadyExists");
+	}
+	else if (Response->Cmd == CMD::CMD_OPEN_ROOM && Response->Code == RESPONSE_CODE::E_PEER_ALREADY_IN_ROOM)
+	{
+		message = strr("YoureAlreadyInARoom");
+	}
+	else if (Response->Cmd == CMD::CMD_OPEN_ROOM && Response->Code == RESPONSE_CODE::E_ROOM_NAME_EMPTY)
+	{
+		message = strr("TheRoomNameIsEmpty");
+	}
+
+	if (Response->Cmd == CMD::CMD_JOIN_ROOM && Response->Code == RESPONSE_CODE::E_ROOM_FULL)
+	{
+		message = strr("ThisRoomIsFull");
+	}
+	else if (Response->Cmd == CMD::CMD_JOIN_ROOM && Response->Code == RESPONSE_CODE::E_ROOM_DOESNT_EXIST)
+	{
+		message = strr("ThisRoomDoesntExist");
+	}
+	else if (Response->Cmd == CMD::CMD_JOIN_ROOM && Response->Code == RESPONSE_CODE::E_ROOM_NAME_EMPTY)
+	{
+		message = strr("TheRoomNameIsEmpty");
+	}
+
+	if (Response->Cmd == CMD::CMD_PEER_REQUEST_VIGEM && Response->Code == RESPONSE_CODE::E_PEER_CANT_EMULATE)
+	{
+		message = strr("PeerNoVigem");
+	}
+	else if (Response->Cmd == CMD::CMD_PEER_REQUEST_VIGEM && Response->Code == RESPONSE_CODE::E_PEER_DECLINE)
+	{
+		message = strr("PeerDeclinedRequest");
+	}
+
+	if (Response->Cmd == CMD::CMD_SEND_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_CONFIG_ALREADY_EXISTS)
+	{
+		message = "Config already exists";
+	}
+	else if (Response->Cmd == CMD::CMD_SEND_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_CONFIG_IS_INVALID)
+	{
+		message = "Config is invalid";
+	}
+
+	if (Response->Cmd == CMD::CMD_GET_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_CONFIG_DOESNT_EXIST)
+	{
+		message = "Config doesn't exist";
+	}
+
+	if (Response->Cmd == CMD::CMD_GET_SCEPADSETTINGS_LIST && Response->Code == RESPONSE_CODE::E_CONFIG_LIST_EMPTY)
+	{
+		*open = false;
+		return true;
+	}
+
+	if (Response->Cmd == CMD::CMD_SEND_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_SERVER_DATABASE_REQUEST_LIMIT_EXCEEDED)
+	{
+		message = "Server received too many configs today, try again later";
+	}
+	else if (Response->Cmd == CMD::CMD_SEND_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_CONFIG_ALREADY_EXISTS)
+	{
+		message = "Config already exists";
+	}
+	else if (Response->Cmd == CMD::CMD_SEND_SCEPADSETTINGS && Response->Code == RESPONSE_CODE::E_CONFIG_IS_INVALID)
+	{
+		message = "The file you've tried to send is not a valid .dsy file";
+	}
+
+	if (Response->Code == RESPONSE_CODE::E_SERVER_LOST_CONNECTION_WITH_DATABASE)
+	{
+		message = "Server has failed to fetch data";
+	}
+	else if (Response->Code == RESPONSE_CODE::E_SERVER_DOESNT_SUPPORT_DATABASE)
+	{
+		message = "Server doesn't support database functionality";
+	}
+
+	if (message == "")
+	{
+		message = "Unhandled error:\nCMD::" + CMDToString(Response->Cmd) + "\nRESPONSE_CODE::" + ResponseCodeToString(Response->Code);
+	}
+
+	bool clicked = false;
+	if (ImGui::BeginPopupModal(cstr("MessageFromServer"), open, ImGuiWindowFlags_AlwaysAutoResize))
+	{
+		ImGui::Text(message.c_str());
+		if (ImGui::Button("OK"))
+		{
+			*open = false;
+			ImGui::CloseCurrentPopup();
+			clicked = true;
+		}
+		ImGui::EndPopup();
+	}
+
+	return clicked;
+}
+
+bool MainWindow::ScreenBlock(bool open, const char *message, const char *popup_id)
+{
+	if (open)
+	{
+		ImGui::OpenPopup(popup_id);
+	}
+
+	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	if (ImGui::BeginPopupModal(popup_id, &open,
+							   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs))
+	{
+		ImGui::TextUnformatted(message);
+		ImGui::EndPopup();
+	}
+
+	return true;
+}
+
+bool MainWindow::ScreenBlockClosable(bool *open, const char *message, const char *popup_id)
+{
+	if (*open)
+	{
+		ImGui::OpenPopup(popup_id);
+	}
+
+	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	if (ImGui::BeginPopupModal(popup_id, open,
+							   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar))
+	{
+		ImGui::TextUnformatted(message);
+		if (ImGui::Button("OK"))
+		{
+			*open = false;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
+
+	return true;
+}
+
+void MainWindow::Errors()
+{
+	if (showLoadFailedError)
+	{
+
+		ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+		ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+		ImGui::OpenPopup(cstr("Error"));
+
+		if (ImGui::BeginPopupModal(cstr("Error"), &showLoadFailedError, ImGuiWindowFlags_AlwaysAutoResize))
+		{
+			ImGui::Text(cstr("ErrorLoadConfig"));
+			ImGui::Separator();
+
+			if (ImGui::Button("OK", ImVec2(120, 0)))
+			{
+				ImGui::CloseCurrentPopup();
+				showLoadFailedError = false;
+			}
+
+			ImGui::EndPopup();
+		}
+	}
+}
+
+bool MainWindow::GetHotkeyFromControllerScreen(bool *open, int countdown, int expectedCountdownLength)
+{
+
+	if (*open)
+	{
+		ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+		ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+		ImGui::OpenPopup("Hotkey");
+
+		if (ImGui::BeginPopupModal("Hotkey", open, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs))
+		{
+			ImGui::Text(cstr("HotkeyHoldMsg"));
+			ImGui::Text("%d", abs(countdown - 3));
+			ImGui::EndPopup();
+		}
+	}
+
+	return true;
+}
+
+bool MainWindow::TreeElement_analogSticks(s_scePadSettings &scePadSettings, s_ScePadData &state)
+{
+	if (ImGui::TreeNodeEx(cstr("AnalogSticks")))
+	{
+		const int previewSize = 100;
+		const ImU32 whiteColor = IM_COL32(255, 255, 255, 255);
+		const ImU32 blackColor = IM_COL32(0, 0, 0, 255);
+		const ImU32 redColor = IM_COL32(255, 0, 0, 255);
+		const ImU32 greenColor = IM_COL32(0, 255, 0, 255);
+
+		auto drawStick = [](const s_SceStickData &stick, bool isPressed, int deadzone, ImVec2 centerPos, ImU32 borderColor)
+		{
+			const float radius = static_cast<float>(previewSize);
+			ImGui::GetWindowDrawList()->AddCircle(centerPos, radius, isPressed ? redColor : borderColor, 32, 2.0f);
+			float normDeadzone = (deadzone * radius) / 128;
+			ImGui::GetWindowDrawList()->AddCircle(centerPos, normDeadzone, greenColor, 32, 2.0f);
+
+			float normX = (stick.X - 128) / 127.0f;
+			float normY = -((stick.Y - 128) / 127.0f);
+
+			ImVec2 stickPos = centerPos;
+			stickPos.x += normX * radius;
+			stickPos.y -= normY * radius;
+
+			ImGui::GetWindowDrawList()->AddCircleFilled(stickPos, 5, redColor, 32);
+			ImGui::GetWindowDrawList()->AddText(ImVec2(stickPos.x, stickPos.y), borderColor, std::to_string(stick.X).c_str());
+			ImGui::GetWindowDrawList()->AddText(ImVec2(stickPos.x - 19, stickPos.y - 40), borderColor, std::to_string(stick.Y).c_str());
+		};
+
+		ImVec2 leftCenter = ImGui::GetCursorScreenPos();
+		leftCenter.x += previewSize;
+		leftCenter.y += previewSize;
+
+		drawStick(state.LeftStick, state.bitmask_buttons & SCE_BM_L3 ? true : false, scePadSettings.leftStickDeadzone, leftCenter, m_IsLightMode ? blackColor : whiteColor);
+
+		ImVec2 rightCenter = leftCenter;
+		rightCenter.x += previewSize * 2.1f;
+
+		drawStick(state.RightStick, state.bitmask_buttons & SCE_BM_R3 ? true : false, scePadSettings.rightStickDeadzone, rightCenter, m_IsLightMode ? blackColor : whiteColor);
+
+		ImGui::Dummy(ImVec2(1, previewSize * 2));
+		ImGui::SetNextItemWidth(400);
+		ImGui::SliderInt(cstr("LeftAnalogStickDeadZone"), &scePadSettings.leftStickDeadzone, 0, 127);
+		ImGui::SetNextItemWidth(400);
+		ImGui::SliderInt(cstr("RightAnalogStickDeadZone"), &scePadSettings.rightStickDeadzone, 0, 127);
+		ImGui::TreePop();
+	}
+
+	return true;
+}
+
+bool MainWindow::Emulation(int currentController, s_scePadSettings &scePadSettings, s_ScePadData &state)
+{
+	ImGui::SeparatorText(cstr("EmulationHeader"));
+
+	if (!m_Vigem.IsVigemConnected())
+	{
+#if (!defined(__linux__)) && (!defined(__MACOS__))
+		ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("VigemMissing"));
+		ImGui::SameLine();
+		ImGui::Spacing();
+		ImGui::SameLine();
+		ImGui::TextLinkOpenURL(cstr("VigemInstallLink"), "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe");
+#else
+		ImGui::TextColored(ImVec4(1, 0, 0, 1), cstr("VigemNotAvailablePlatform"));
+#endif
+	}
+	else
+	{
+		ImGui::RadioButton(cstr("None"), &scePadSettings.emulatedController, 0);
+		ImGui::SameLine();
+		ImGui::RadioButton("Xbox 360", &scePadSettings.emulatedController, 1);
+		ImGui::SameLine();
+		ImGui::RadioButton("DualShock 4", &scePadSettings.emulatedController, 2);
+		m_Vigem.PlugControllerByIndex(currentController, scePadSettings.emulatedController);
+		std::string instanceId = scePadGetPath(g_ScePad[currentController]);
+
+		static bool lastHidHideStatus[4] = {false, false, false, false};
+			if (m_IsAdminWindows && (scePadSettings.Hidden != lastHidHideStatus[currentController]))
+			{
+				if (!scePadSettings.WasHidHideRanAfterLoad && scePadSettings.Hidden)
+				{
+					std::thread([instanceId, &scePadSettings]() {
+						HideController(instanceId);
+						}).detach();
+				}
+				else if (!scePadSettings.WasHidHideRanAfterLoad && !scePadSettings.Hidden)
+				{
+					std::thread([instanceId, &scePadSettings]() {
+						UnhideController(instanceId);
+						}).detach();
+				}
+
+				lastHidHideStatus[currentController] = scePadSettings.Hidden;
+				scePadSettings.WasHidHideRanAfterLoad = true;
+			}
+		
+
+		ImGui::NewLine();
+		if (ImGui::TreeNodeEx(cstr("ControllerSettings"), ImGuiTreeNodeFlags_DefaultOpen))
+		{
+			if (ImGui::TreeNode(cstr("HideRealController")))
+			{
+				if (m_IsAdminWindows)
+				{
+					static bool isHidHideInstalled = getHidHideExecutablePath() != "" ? true : false;
+					if (isHidHideInstalled)
+					{
+						if (ImGui::Button(cstr("Hide")))
+						{
+							// thread for hiding
+							std::thread([instanceId, &scePadSettings]() {
+								HideController(instanceId);
+								scePadSettings.Hidden = true;
+							}).detach();
+						}
+						ImGui::SameLine();
+						if (ImGui::Button(cstr("Unhide")))
+						{
+							std::thread([instanceId, &scePadSettings]() {
+								UnhideController(instanceId);
+								scePadSettings.Hidden = false;
+							}).detach();
+						}
+					}
+					else
+					{
+						ImGui::TextColored(ImVec4(1, 1, 0, 1), cstr("HidHideNotInstalled"));
+						ImGui::TextLinkOpenURL(cstr("HidHideInstallLink"), "https://github.com/nefarius/HidHide/releases");
+					}
+				}
+				else
+				{
+					ImGui::TextColored(ImVec4(1, 1, 0, 1), cstr("UnavailableInNonAdminMode"));
+				}
+				ImGui::TreePop();
+			}
+
+			TreeElement_analogSticks(scePadSettings, state);
+			TreeElement_lightbar(scePadSettings);
+			TreeElement_vibration(scePadSettings);
+			TreeElement_dynamicAdaptiveTriggers(scePadSettings, currentController);
+			TreeElement_motion(scePadSettings, state, currentController);
+			TreeElement_touchpad(scePadSettings);
+			TreeElement_sharebtn(scePadSettings);
+
+			ImGui::TreePop();
+		}
+	}
+
+	return true;
+}
+
+void MainWindow::Show(s_scePadSettings scePadSettings[4], float scale)
+{
+	static int c = 0;
+	scale = 100 * (scale * 2.5);
+
+	const ImGuiViewport *viewport = ImGui::GetMainViewport();
+	ImGui::SetNextWindowPos(viewport->WorkPos);
+	ImGui::SetNextWindowSize(viewport->WorkSize);
+
+	ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBringToFrontOnFocus);
+	// ImGui::TextColored(ImVec4(1, 0, 0, 1), "Work in progress. Older build at v2 branch on GitHub");
+	s_ScePadData state = {};
+	scePadReadState(g_ScePad[c], &state);
+
+	Errors();
+	MenuBar(c, scePadSettings[c]);
+	if (Controllers(c, scePadSettings[c], scale))
+	{
+		Emulation(c, scePadSettings[c], state);
+		Led(scePadSettings[c], scale);
+		AdaptiveTriggers(scePadSettings[c]);
+		Audio(c, scePadSettings[c]);
+		Touchpad(c, scePadSettings[c], state, scale);
+		KeyboardAndMouseMapping(scePadSettings[c], state);
+	}
+	Online(scePadSettings[c]);
+
+	// Apply triggers from UI
+	for (int i = 0; i < TRIGGER_COUNT; i++)
+	{
+		std::vector<uint8_t> vec;
+
+		for (int j = 0; j < MAX_PARAM_COUNT; j++)
+		{
+			vec.push_back(scePadSettings[c].uiParameters[i][j]);
+		}
+
+		if (scePadSettings[c].uiTriggerFormat[i] == SONY_FORMAT)
+		{
+			if (auto it = sonyTriggerHandlers.find(sonyItems[scePadSettings[c].currentSonyItem[i]]); it != sonyTriggerHandlers.end())
+				it->second(scePadSettings[c], i, vec);
+		}
+		else
+		{
+			if (auto it = dsxTriggerHandlers.find(dsxItems[scePadSettings[c].currentDSXItem[i]]); it != dsxTriggerHandlers.end())
+				it->second(scePadSettings[c], i, vec);
+		}
+	}
+
+	m_SelectedController = c;
+
+	ImGui::End();
+}
+
+int MainWindow::GetSelectedController()
+{
+	return m_SelectedController;
+}

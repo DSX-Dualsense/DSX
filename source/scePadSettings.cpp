@@ -1,0 +1,300 @@
+#include "scePadSettings.hpp"
+#include "led.hpp"
+#include <algorithm>
+#include <fstream>
+#include <imgui.h>
+#include <platform_folders.h>
+
+static std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+// <Mac address, was loaded>
+static std::unordered_map<std::string, bool> loadList;
+
+void SaveSettingsToFile(const s_scePadSettings &s, const std::string &filepath)
+{
+
+	std::filesystem::path filePath = std::filesystem::u8path(filepath);
+	if (!std::filesystem::exists(filePath.parent_path()))
+		std::filesystem::create_directory(filePath.parent_path());
+	nlohmann::json j = s;
+	std::ofstream(filePath) << j.dump(4);
+}
+
+bool LoadSettingsFromFile(s_scePadSettings *s, const std::string &filepath)
+{
+	try
+	{
+		std::ifstream ifs(std::filesystem::u8path(filepath));
+		if (!ifs)
+			return false;
+		nlohmann::json j;
+		ifs >> j;
+		*s = j.get<s_scePadSettings>();
+		return true;
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+bool GetDefaultConfigFromMac(const std::string &mac, s_scePadSettings *s)
+{
+	std::string cleanMac = mac;
+	cleanMac.erase(std::remove(cleanMac.begin(), cleanMac.end(), ':'), cleanMac.end());
+	std::filesystem::path filePath = std::filesystem::u8path(sago::getDocumentsFolder() + "/DSY/DefaultConfigs/" + cleanMac);
+
+	if (std::filesystem::exists(filePath))
+	{
+		std::ifstream file(filePath);
+		std::string configPath = "";
+		std::getline(file, configPath); // the stored path may contain spaces
+		file.close();
+		LoadSettingsFromFile(s, configPath);
+		return true;
+	}
+
+	return false;
+}
+
+bool RemoveDefaultConfigByMac(const std::string &mac)
+{
+	std::string cleanMac = mac;
+	cleanMac.erase(std::remove(cleanMac.begin(), cleanMac.end(), ':'), cleanMac.end());
+	std::filesystem::path filePath = std::filesystem::u8path(sago::getDocumentsFolder() + "/DSY/DefaultConfigs/" + cleanMac);
+
+	if (std::filesystem::exists(filePath))
+	{
+		std::filesystem::remove(filePath);
+		return true;
+	}
+
+	return false;
+}
+
+void LoadDefaultConfig(int currentController, s_scePadSettings *s)
+{
+	std::string macAddress = scePadGetMacAddress(g_ScePad[currentController]);
+
+	if (macAddress != "" && !loadList[macAddress])
+	{
+		if (GetDefaultConfigFromMac(macAddress, s))
+		{
+			s->WasHidHideRanAfterLoad = false;
+			loadList[macAddress] = true;
+		}
+	}
+}
+
+void ForceControllerToNotLoadDefault(int controller)
+{
+	std::string macAddress = scePadGetMacAddress(g_ScePad[controller]);
+	loadList[macAddress] = true;
+}
+
+std::string ScePadSettingsToString(s_scePadSettings *s)
+{
+	nlohmann::json j = *s;
+	return j.dump();
+}
+
+bool LoadSettingsFromString(s_scePadSettings *s, const std::string &String)
+{
+	try
+	{
+		nlohmann::json j = nlohmann::json::parse(String);
+		*s = j.get<s_scePadSettings>();
+		return true;
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+bool SaveSettingsFromString(const std::string &String, const std::string &Path)
+{
+	try
+	{
+		s_scePadSettings settings = {};
+		nlohmann::json j = nlohmann::json::parse(String);
+		settings = j.get<s_scePadSettings>();
+		SaveSettingsToFile(settings, Path);
+		return true;
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+void applySettings(uint32_t index, s_scePadSettings settings, AudioPassthrough &audio)
+{
+	auto now = std::chrono::steady_clock::now();
+	auto sec = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+	float elapsed = std::chrono::duration<float>(now - startTime).count();
+
+	float discoModeTime = fmod(elapsed * settings.discoModeSpeed, 1.0f);
+	s_SceLightBar rainbowLightbar = {};
+	GetRainbowColor(discoModeTime, rainbowLightbar);
+
+	float audioPeak = audio.GetCurrentCapturePeak();
+	uint8_t audioPeakUint8 = (uint8_t)scaleFloatToInt(audioPeak, 1.0);
+
+	if (settings.useLightbarFromEmulatedController && (settings.emulatedController == (int)EmulatedController::DUALSHOCK4 || settings.usingPeerController))
+	{
+		scePadSetLightBar(g_ScePad[index], &settings.lightbarFromEmulatedController);
+	}
+	else if (settings.audioToLed && !settings.discoMode)
+	{
+		s_SceLightBar lightbar = {audioPeakUint8, audioPeakUint8, audioPeakUint8};
+		scePadSetLightBar(g_ScePad[index], &lightbar);
+	}
+	else if (settings.audioToLed && settings.discoMode)
+	{
+		s_SceLightBar lightbar = {std::min(audioPeakUint8, rainbowLightbar.r), std::min(audioPeakUint8, rainbowLightbar.g), std::min(audioPeakUint8, rainbowLightbar.b)};
+		scePadSetLightBar(g_ScePad[index], &lightbar);
+	}
+	else if (settings.discoMode)
+	{
+		scePadSetLightBar(g_ScePad[index], &rainbowLightbar);
+	}
+	else
+	{
+		s_SceLightBar lightbar = {(uint8_t)scaleFloatToInt(settings.led[0], 1.0f), (uint8_t)scaleFloatToInt(settings.led[1], 1.0f), (uint8_t)scaleFloatToInt(settings.led[2], 1.0f)};
+		scePadSetLightBar(g_ScePad[index], &lightbar);
+	}
+
+	scePadSetPlayerLedBrightness(g_ScePad[index], settings.brightness);
+	scePadSetPlayerLed(g_ScePad[index], settings.disablePlayerLed ? false : true);
+	bool micLedState = settings.gyroToRightStick && settings.gyroToRightStickPermanent;
+	scePadSetMicLed(g_ScePad[index], micLedState);
+	if (!settings.udpConfig)
+	{
+		if (settings.speakerVolume == 0)
+			scePadSetAudioOutPath(g_ScePad[index], SCE_PAD_AUDIO_PATH_STEREO_HEADSET);
+		else
+			scePadSetAudioOutPath(g_ScePad[index], settings.audioPath);
+	}
+
+	s_SceControllerType controllerType = {};
+	scePadGetControllerType(g_ScePad[index], &controllerType);
+
+	s_ScePadVolumeGain volume = {};
+	volume.speakerVolume = settings.speakerVolume * 9;
+	volume.micGain = settings.micGain * 6;
+	scePadSetVolumeGain(g_ScePad[index], &volume);
+
+	audio.SetHapticIntensityByUserId(index + 1, settings.hapticIntensity);
+	audio.SetSpeakerVolumeByUserId(index + 1, (float)settings.speakerVolume / 8.0f);
+
+	int l2Value = settings.rumbleToAt_swapTriggers ? settings.rumbleFromEmulatedController.smallMotor : settings.rumbleFromEmulatedController.largeMotor;
+	int r2Value = settings.rumbleToAt_swapTriggers ? settings.rumbleFromEmulatedController.largeMotor : settings.rumbleFromEmulatedController.smallMotor;
+
+	if (settings.triggersAsButtons && (settings.usingPeerController || settings.emulatedController != (int)EmulatedController::NONE))
+	{
+		uint8_t leftTrigger[11] = {};
+		uint8_t rightTrigger[11] = {};
+
+		CustomTriggerHardestB(leftTrigger, settings.triggersAsButtonStartPos);
+		CustomTriggerHardestB(rightTrigger, settings.triggersAsButtonStartPos);
+		scePadSetTriggerEffectCustom(g_ScePad[index], leftTrigger, rightTrigger, SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_L2 | SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_R2);
+	}
+	else if (settings.hapticsToAt && settings.audioPassthrough)
+	{
+		uint8_t leftTrigger[11] = {};
+		uint8_t rightTrigger[11] = {};
+
+		float rawL = audio.GetHapticLevelL(index + 1);
+		float rawR = audio.GetHapticLevelR(index + 1);
+
+		float levelL = settings.hapticsToAt_swapTriggers ? rawR : rawL;
+		float levelR = settings.hapticsToAt_swapTriggers ? rawL : rawR;
+
+		levelL *= settings.hapticsToAt_intensity;
+		levelR *= settings.hapticsToAt_intensity;
+
+		const float noiseGate = 0.03f;
+		if (levelL < noiseGate) levelL = 0.0f;
+		if (levelR < noiseGate) levelR = 0.0f;
+
+		levelL = std::clamp(levelL, 0.0f, 1.0f);
+		levelR = std::clamp(levelR, 0.0f, 1.0f);
+
+		auto applyHapticEffect = [](float level, int mode, uint8_t trigger[11])
+		{
+			if (level <= 0.0f)
+			{
+				CustomTriggerOFF(trigger);
+				return;
+			}
+
+			if (mode == 0)
+			{
+				// Mode 0: Vibration (Pulse_B)
+				uint8_t freq = static_cast<uint8_t>(std::clamp(static_cast<int>(5.0f + level * 30.0f), 5, 40));
+				uint8_t intensity = static_cast<uint8_t>(std::clamp(static_cast<int>(level * 255.0f), 10, 255));
+				uint8_t pos = 0;
+				std::vector<uint8_t> param = { freq, intensity, pos };
+				CustomTriggerBetterVibration(param, trigger);
+			}
+			else
+			{
+				// Mode 1: Dynamic Resistance (Feedback)
+				uint8_t force = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(level * 8.0f)), 1, 8));
+				uint8_t start = 0;
+				std::vector<uint8_t> param = { start, force };
+				CustomTriggerResistance(param, trigger);
+			}
+		};
+
+		applyHapticEffect(levelL, settings.hapticsToAt_mode, leftTrigger);
+		applyHapticEffect(levelR, settings.hapticsToAt_mode, rightTrigger);
+
+		scePadSetTriggerEffectCustom(g_ScePad[index], leftTrigger, rightTrigger, SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_L2 | SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_R2);
+	}
+	else if (settings.rumbleToAT && (settings.usingPeerController || settings.emulatedController != (int)EmulatedController::NONE))
+	{
+		uint8_t leftTrigger[11] = {};
+		uint8_t rightTrigger[11] = {};
+
+		std::vector<uint8_t> l2Param;
+		l2Param.push_back(std::min(l2Value, settings.rumbleToAt_frequency[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_L2]));
+		l2Param.push_back(std::min(l2Value, settings.rumbleToAt_intensity[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_L2]));
+		l2Param.push_back(settings.rumbleToAt_position[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_L2]);
+
+		std::vector<uint8_t> r2Param;
+		r2Param.push_back(std::min(r2Value, settings.rumbleToAt_frequency[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_R2]));
+		r2Param.push_back(std::min(r2Value, settings.rumbleToAt_intensity[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_R2]));
+		r2Param.push_back(settings.rumbleToAt_position[SCE_PAD_TRIGGER_EFFECT_PARAM_INDEX_FOR_R2]);
+
+		CustomTriggerBetterVibration(l2Param, leftTrigger);
+		CustomTriggerBetterVibration(r2Param, rightTrigger);
+
+		scePadSetTriggerEffectCustom(g_ScePad[index], leftTrigger, rightTrigger, SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_L2 | SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_R2);
+	}
+	else
+	{
+		settings.stockTriggerParam.triggerMask |= settings.isLeftUsingDsxTrigger ? 0 : SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_L2;
+		settings.stockTriggerParam.triggerMask |= settings.isRightUsingDsxTrigger ? 0 : SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_R2;
+		scePadSetTriggerEffect(g_ScePad[index], &settings.stockTriggerParam);
+
+		uint8_t triggerBitmask = 0;
+		triggerBitmask |= settings.isLeftUsingDsxTrigger ? SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_L2 : 0;
+		triggerBitmask |= settings.isRightUsingDsxTrigger ? SCE_PAD_TRIGGER_EFFECT_TRIGGER_MASK_R2 : 0;
+		scePadSetTriggerEffectCustom(g_ScePad[index], settings.leftCustomTrigger.data(), settings.rightCustomTrigger.data(), triggerBitmask);
+	}
+
+	if (settings.useRumbleFromEmulatedController || settings.udpConfig)
+	{
+		if (settings.rumbleFromEmulatedController.largeMotor > 0 || settings.rumbleFromEmulatedController.smallMotor > 0)
+		{
+			scePadSetVibrationMode(g_ScePad[index], SCE_PAD_RUMBLE_MODE);
+		}
+		else
+		{
+			scePadSetVibrationMode(g_ScePad[index], SCE_PAD_HAPTICS_MODE);
+		}
+
+		scePadSetVibration(g_ScePad[index], &settings.rumbleFromEmulatedController);
+	}
+}
